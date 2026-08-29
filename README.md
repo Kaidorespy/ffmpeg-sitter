@@ -1,66 +1,76 @@
 # ffmpeg-sitter
 
-![Status](https://img.shields.io/badge/status-100%25-brightgreen)
-![Platform](https://img.shields.io/badge/platform-Windows-blue)
+![Version](https://img.shields.io/badge/version-2_in_development-00ffc8)
+![Platform](https://img.shields.io/badge/platform-Windows_10+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-One-click FFmpeg installer for Windows. Downloads, extracts, adds to PATH. Done.
-
-## The Problem
-
-Every time you set up a new machine:
-1. Google "ffmpeg download"
-2. Find the right build
-3. Download 80MB zip
-4. Extract somewhere
-5. Add to PATH manually
-6. Restart terminals
-7. Repeat when you forget where you put it
-
-## The Solution
-
-Click a button. FFmpeg is installed and in your PATH.
+A small Windows installer and cleanup assistant for FFmpeg.
 
 ## Features
 
-- **One-click install** - Downloads latest FFmpeg release
-- **Automatic PATH** - Adds to user PATH, no admin needed
-- **Obliterate mode** - Find and delete stray FFmpeg copies cluttering your system
-- **Protected detection** - Won't touch FFmpeg bundled with OBS, Audacity, etc.
-- **Code snippets** - Generates copy-paste code to point apps at FFmpeg
+- **One-click install** - Download the current Gyan FFmpeg essentials build
+- **Validated upgrades** - Test a staged replacement before touching the working installation
+- **Automatic user PATH** - Add or remove FFmpeg without administrator access
+- **Cleanup review** - Find likely standalone copies and inspect every proposed target
+- **Recoverable quarantine** - Move confirmed targets with a restoration manifest instead of deleting them
+- **Protected detection** - Leave copies bundled with applications such as OBS and Audacity alone
+- **Code snippets** - Generate examples for pointing other applications at FFmpeg
 
 ## Install
 
-No dependencies - just Python 3 and tkinter (included with Python).
+No third-party Python packages are required. Python 3 with Tkinter is sufficient.
 
 ## Run
 
-```bash
+```powershell
 python ffmpeg-sitter.py
 ```
 
 ## Usage
 
-1. Click "Install FFmpeg" - downloads to `~/ffmpeg`
-2. Click "Add to PATH" - makes it available everywhere
-3. Restart any open terminals
+1. Select **Install FFmpeg** to install or safely replace FFmpeg under `%USERPROFILE%\ffmpeg`.
+2. Select **Add to PATH** to make it available to newly opened terminals and applications.
+3. Restart terminals that were already open.
 
-### Cleanup Mode
+The installation contains:
 
-Click "Obliterate other copies" to:
-- Search your system for standalone FFmpeg installs
-- Safely delete duplicates (protects app-bundled copies)
-- Show code snippets to update any broken references
-
-## Where It Installs
-
-```
-~/ffmpeg/
-  bin/
+```text
+%USERPROFILE%\ffmpeg\
+  bin\
     ffmpeg.exe
     ffprobe.exe
     ffplay.exe
 ```
+
+## Cleanup review
+
+Select **Review other copies** to search the configured locations. ffmpeg-sitter displays every proposed standalone target before it acts. Application-bundled copies remain protected.
+
+Confirmed targets move to:
+
+```text
+%LOCALAPPDATA%\ffmpeg-sitter\quarantine\<timestamp>\
+```
+
+Each quarantine contains `manifest.json`, mapping the original paths to their new locations. Nothing in cleanup review is permanently deleted.
+
+## Development
+
+Run the tests with:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Version 2 work is documented in [CHANGELOG.md](CHANGELOG.md).
+
+## Build
+
+```powershell
+pyinstaller ffmpeg-sitter.spec
+```
+
+The configured download is the Gyan FFmpeg release essentials ZIP. Those builds currently target Windows 10 or later.
 
 ## License
 

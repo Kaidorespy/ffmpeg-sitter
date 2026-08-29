@@ -3,15 +3,21 @@ import shutil
 import zipfile
 import tempfile
 import threading
+import queue
+import json
 import tkinter as tk
 from tkinter import messagebox
 import urllib.request
 import winreg
 import subprocess
+from datetime import datetime
+from pathlib import Path
 
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 INSTALL_DIR = os.path.expanduser("~/ffmpeg")
 BIN_DIR = os.path.join(INSTALL_DIR, "bin")
+APP_VERSION = "2.0-dev"
+QUARANTINE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ffmpeg-sitter" / "quarantine"
 
 # Places ffmpeg likes to hide (standalone copies)
 SEARCH_LOCATIONS = [
@@ -32,12 +38,82 @@ PROTECTED_APPS = {
     'appdata', 'programdata', 'windows', 'system32', 'syswow64',
 }
 
+
+def normalize_path(path):
+    """Normalize a PATH entry for exact, case-insensitive comparisons."""
+    path = os.path.expandvars(str(path).strip().strip('"'))
+    return os.path.normcase(os.path.normpath(path)) if path else ""
+
+
+def split_path(path_value):
+    return [part.strip() for part in path_value.split(';') if part.strip()]
+
+
+def path_contains(path_value, entry):
+    target = normalize_path(entry)
+    return any(normalize_path(part) == target for part in split_path(path_value))
+
+
+def add_path_entry(path_value, entry):
+    parts = split_path(path_value)
+    if not path_contains(path_value, entry):
+        parts.append(entry)
+    return ';'.join(parts)
+
+
+def remove_path_entry(path_value, entry):
+    target = normalize_path(entry)
+    return ';'.join(part for part in split_path(path_value) if normalize_path(part) != target)
+
+
+def safe_zip_members(zf):
+    """Reject archive entries that could escape the extraction directory."""
+    for member in zf.infolist():
+        path = Path(member.filename)
+        if path.is_absolute() or '..' in path.parts:
+            raise ValueError(f"unsafe archive path: {member.filename}")
+    return zf.infolist()
+
+
+def is_within(path, parent):
+    try:
+        return os.path.commonpath([normalize_path(path), normalize_path(parent)]) == normalize_path(parent)
+    except ValueError:
+        return False
+
+
+def deduplicate_paths(paths):
+    """Return unique normalized paths without children of another target."""
+    unique = sorted({normalize_path(path): os.path.normpath(path) for path in paths}.values(), key=len)
+    result = []
+    for path in unique:
+        normalized = normalize_path(path)
+        if not any(is_within(normalized, parent) for parent in result):
+            result.append(path)
+    return result
+
+
+def cleanup_target(location):
+    """Choose the narrowest safe target for a discovered FFmpeg executable."""
+    location = Path(location)
+    if 'ffmpeg' in location.name.lower():
+        target = location
+    elif 'ffmpeg' in location.parent.name.lower():
+        target = location.parent
+    else:
+        target = location / 'ffmpeg.exe'
+
+    forbidden = {normalize_path(Path.home()), normalize_path(Path(target.anchor)), normalize_path(INSTALL_DIR)}
+    return None if normalize_path(target) in forbidden else str(target)
+
 class FFmpegSitter:
     def __init__(self):
+        self.ui_queue = queue.Queue()
+        self.closing = False
         self.root = tk.Tk()
-        self.root.title("ffmpeg-sitter")
+        self.root.title(f"ffmpeg-sitter {APP_VERSION}")
         self.root.configure(bg='#1a1a2e')
-        self.root.geometry("400x230")
+        self.root.geometry("420x250")
         self.root.resizable(False, False)
 
         # Title
@@ -55,7 +131,8 @@ class FFmpegSitter:
             text="checking for ffmpeg...",
             font=("Consolas", 10),
             bg='#1a1a2e',
-            fg='#888'
+            fg='#888',
+            wraplength=390
         )
         self.status.pack(pady=5)
 
@@ -100,7 +177,7 @@ class FFmpegSitter:
         # PURGE button
         self.purge_btn = tk.Button(
             self.bottom_frame,
-            text="obliterate other copies",
+            text="review other copies",
             font=("Consolas", 9),
             bg='#ff4757',
             fg='white',
@@ -131,14 +208,37 @@ class FFmpegSitter:
             text="",
             font=("Consolas", 9),
             bg='#1a1a2e',
-            fg='#666'
+            fg='#666',
+            wraplength=390
         )
         self.location.pack(pady=5)
 
         # Check current state
         self.root.after(100, self.check_status)
+        self.root.after(50, self._process_ui_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.root.mainloop()
+
+    def _process_ui_queue(self):
+        try:
+            while True:
+                action, payload = self.ui_queue.get_nowait()
+                if action == 'status':
+                    text, color = payload
+                    self.status.config(text=text, fg=color)
+                elif action == 'install_done':
+                    self._install_done(*payload)
+                elif action == 'purge_results':
+                    self._show_purge_results(*payload)
+        except queue.Empty:
+            pass
+        if not self.closing:
+            self.root.after(50, self._process_ui_queue)
+
+    def close(self):
+        self.closing = True
+        self.root.destroy()
 
     def check_status(self):
         # Check if in PATH
@@ -163,51 +263,71 @@ class FFmpegSitter:
 
     def install(self):
         self.install_btn.config(state='disabled', text='downloading...')
-        self.status.config(text="downloading ffmpeg (~80MB)...", fg='#ffa502')
-        thread = threading.Thread(target=self._do_install)
+        self.status.config(text="downloading ffmpeg (~100MB)...", fg='#ffa502')
+        self.purge_btn.config(state='disabled')
+        self.uninstall_btn.config(state='disabled')
+        thread = threading.Thread(target=self._do_install, daemon=True)
         thread.start()
 
     def _do_install(self):
         try:
-            # Create temp file for download
-            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
-                tmp_path = tmp.name
+            with tempfile.TemporaryDirectory(prefix='ffmpeg-sitter-') as temp_dir:
+                temp_path = Path(temp_dir)
+                archive_path = temp_path / 'ffmpeg.zip'
+                extract_dir = temp_path / 'extracted'
 
-            # Download with progress
-            def report(block, block_size, total):
-                downloaded = block * block_size
-                pct = min(100, int(downloaded * 100 / total)) if total > 0 else 0
-                self.root.after(0, lambda: self.status.config(
-                    text=f"downloading... {pct}%", fg='#ffa502'
-                ))
+                def report(block, block_size, total):
+                    downloaded = block * block_size
+                    pct = min(100, int(downloaded * 100 / total)) if total > 0 else 0
+                    self.ui_queue.put(('status', (f"downloading... {pct}%", '#ffa502')))
 
-            urllib.request.urlretrieve(FFMPEG_URL, tmp_path, report)
+                urllib.request.urlretrieve(FFMPEG_URL, archive_path, report)
+                self.ui_queue.put(('status', ("validating download...", '#ffa502')))
 
-            self.root.after(0, lambda: self.status.config(text="extracting...", fg='#ffa502'))
+                with zipfile.ZipFile(archive_path, 'r') as zf:
+                    members = safe_zip_members(zf)
+                    zf.extractall(extract_dir, members=members)
 
-            # Clean old install
-            if os.path.exists(INSTALL_DIR):
-                shutil.rmtree(INSTALL_DIR)
+                bin_candidates = [
+                    path.parent for path in extract_dir.rglob('ffmpeg.exe')
+                    if path.parent.joinpath('ffprobe.exe').exists()
+                ]
+                if not bin_candidates:
+                    raise RuntimeError("archive did not contain ffmpeg.exe and ffprobe.exe")
 
-            # Extract
-            with zipfile.ZipFile(tmp_path, 'r') as zf:
-                # Find the inner folder name (e.g., ffmpeg-7.0-essentials_build)
-                inner_folder = zf.namelist()[0].split('/')[0]
-                zf.extractall(tempfile.gettempdir())
+                staged_root = bin_candidates[0].parent
+                check = subprocess.run(
+                    [str(bin_candidates[0] / 'ffmpeg.exe'), '-version'],
+                    capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    timeout=15
+                )
+                if check.returncode != 0:
+                    raise RuntimeError("downloaded ffmpeg failed its version check")
 
-            # Move to final location
-            extracted = os.path.join(tempfile.gettempdir(), inner_folder)
-            shutil.move(extracted, INSTALL_DIR)
+                backup_dir = Path(f"{INSTALL_DIR}.backup")
+                install_dir = Path(INSTALL_DIR)
+                if backup_dir.exists():
+                    shutil.rmtree(backup_dir)
+                if install_dir.exists():
+                    os.replace(install_dir, backup_dir)
+                try:
+                    shutil.move(str(staged_root), install_dir)
+                except Exception:
+                    if backup_dir.exists() and not install_dir.exists():
+                        os.replace(backup_dir, install_dir)
+                    raise
+                if backup_dir.exists():
+                    shutil.rmtree(backup_dir)
 
-            # Clean up
-            os.unlink(tmp_path)
-
-            self.root.after(0, lambda: self._install_done(True))
+            self.ui_queue.put(('install_done', (True, None)))
 
         except Exception as e:
-            self.root.after(0, lambda: self._install_done(False, str(e)))
+            self.ui_queue.put(('install_done', (False, str(e))))
 
     def _install_done(self, success, error=None):
+        self.purge_btn.config(state='normal')
+        self.uninstall_btn.config(state='normal')
         if success:
             self.status.config(text="ffmpeg installed!", fg='#00ffc8')
             self.location.config(text=f"location: {BIN_DIR}")
@@ -230,21 +350,19 @@ class FFmpegSitter:
                 0,
                 winreg.KEY_ALL_ACCESS
             )
-
             try:
-                current_path, _ = winreg.QueryValueEx(key, "PATH")
-            except FileNotFoundError:
-                current_path = ""
+                try:
+                    current_path, value_type = winreg.QueryValueEx(key, "PATH")
+                except FileNotFoundError:
+                    current_path, value_type = "", winreg.REG_EXPAND_SZ
 
-            # Check if already in PATH
-            if BIN_DIR.lower() in current_path.lower():
-                messagebox.showinfo("Already done", "ffmpeg is already in PATH!")
-                return
+                if path_contains(current_path, BIN_DIR):
+                    messagebox.showinfo("Already done", "ffmpeg is already in PATH!")
+                    return
 
-            # Add to PATH
-            new_path = f"{current_path};{BIN_DIR}" if current_path else BIN_DIR
-            winreg.SetValueEx(key, "PATH", 0, winreg.REG_EXPAND_SZ, new_path)
-            winreg.CloseKey(key)
+                winreg.SetValueEx(key, "PATH", 0, value_type, add_path_entry(current_path, BIN_DIR))
+            finally:
+                winreg.CloseKey(key)
 
             # Notify system of change
             import ctypes
@@ -293,10 +411,7 @@ class FFmpegSitter:
             try:
                 current_path, _ = winreg.QueryValueEx(key, "PATH")
 
-                # Remove our bin dir from PATH
-                path_parts = current_path.split(';')
-                new_parts = [p for p in path_parts if p.lower() != BIN_DIR.lower()]
-                new_path = ';'.join(new_parts)
+                new_path = remove_path_entry(current_path, BIN_DIR)
 
                 if new_path != current_path:
                     winreg.SetValueEx(key, "PATH", 0, winreg.REG_EXPAND_SZ, new_path)
@@ -341,7 +456,9 @@ class FFmpegSitter:
     def purge(self):
         self.purge_btn.config(state='disabled', text='hunting...')
         self.status.config(text="searching for ffmpeg copies...", fg='#ffa502')
-        thread = threading.Thread(target=self._find_all_ffmpeg)
+        self.install_btn.config(state='disabled')
+        self.uninstall_btn.config(state='disabled')
+        thread = threading.Thread(target=self._find_all_ffmpeg, daemon=True)
         thread.start()
 
     def _is_standalone_ffmpeg(self, path):
@@ -379,18 +496,19 @@ class FFmpegSitter:
                 for root, dirs, files in os.walk(base):
                     searched += 1
                     if searched % 500 == 0:
-                        self.root.after(0, lambda s=searched: self.status.config(
-                            text=f"searched {s} folders...", fg='#ffa502'
-                        ))
+                        self.ui_queue.put(('status', (f"searched {searched} folders...", '#ffa502')))
 
                     # Skip our install location
-                    if os.path.normpath(root).startswith(os.path.normpath(INSTALL_DIR)):
+                    if is_within(root, INSTALL_DIR) or is_within(root, QUARANTINE_DIR):
+                        dirs.clear()
                         continue
 
                     # Look for ffmpeg.exe
                     if 'ffmpeg.exe' in files:
                         if self._is_standalone_ffmpeg(root):
-                            found_safe.append(root)
+                            target = cleanup_target(root)
+                            if target:
+                                found_safe.append(target)
                         else:
                             found_risky.append(root)
 
@@ -407,10 +525,12 @@ class FFmpegSitter:
             except Exception:
                 continue
 
-        self.root.after(0, lambda: self._show_purge_results(found_safe, found_risky))
+        self.ui_queue.put(('purge_results', (deduplicate_paths(found_safe), deduplicate_paths(found_risky))))
 
     def _show_purge_results(self, found_safe, found_risky):
-        self.purge_btn.config(state='normal', text='obliterate all other copies')
+        self.purge_btn.config(state='normal', text='review other copies')
+        self.install_btn.config(state='normal')
+        self.uninstall_btn.config(state='normal')
 
         if not found_safe and not found_risky:
             self.status.config(text="no other ffmpeg copies found!", fg='#00ffc8')
@@ -419,23 +539,6 @@ class FFmpegSitter:
                 "No other ffmpeg installations found.\n\nYou're already tidy."
             )
             return
-
-        # Build message
-        msg = "ffmpeg-sitter found:\n\n"
-
-        if found_safe:
-            msg += f"STANDALONE ({len(found_safe)}) - safe to delete:\n"
-            msg += "\n".join(f"  • {p}" for p in found_safe[:5])
-            if len(found_safe) > 5:
-                msg += f"\n  ... and {len(found_safe) - 5} more"
-            msg += "\n\n"
-
-        if found_risky:
-            msg += f"BUNDLED ({len(found_risky)}) - protected:\n"
-            msg += "\n".join(f"  • {p}" for p in found_risky[:3])
-            if len(found_risky) > 3:
-                msg += f"\n  ... and {len(found_risky) - 3} more"
-            msg += "\n\n"
 
         if not found_safe:
             self.status.config(text=f"found {len(found_risky)} bundled (protected)", fg='#ffa502')
@@ -447,58 +550,96 @@ class FFmpegSitter:
             )
             return
 
-        result = messagebox.askyesno(
-            "ffmpeg-sitter // obliterate?",
-            f"{msg}"
-            f"DELETE THE {len(found_safe)} STANDALONE COPIES?\n\n"
-            "(Your ~/ffmpeg and bundled copies are protected)",
-            icon='warning'
-        )
+        review = tk.Toplevel(self.root)
+        review.title("ffmpeg-sitter // cleanup review")
+        review.configure(bg='#1a1a2e')
+        review.geometry("680x400")
+        review.transient(self.root)
+        review.grab_set()
 
-        if result:
-            self._do_purge(found_safe)
+        tk.Label(
+            review,
+            text=f"Review {len(found_safe)} standalone target{'s' if len(found_safe) != 1 else ''}",
+            font=("Consolas", 12, "bold"), bg='#1a1a2e', fg='#ffa502'
+        ).pack(pady=(15, 5))
+        tk.Label(
+            review,
+            text=f"{len(found_risky)} app-bundled location{'s' if len(found_risky) != 1 else ''} protected",
+            font=("Consolas", 9), bg='#1a1a2e', fg='#888'
+        ).pack(pady=(0, 10))
+
+        list_frame = tk.Frame(review, bg='#1a1a2e')
+        list_frame.pack(fill='both', expand=True, padx=15)
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side='right', fill='y')
+        targets = tk.Listbox(
+            list_frame, yscrollcommand=scrollbar.set, font=("Consolas", 9),
+            bg='#0d1117', fg='#ffffff', selectbackground='#16213e'
+        )
+        targets.pack(fill='both', expand=True)
+        scrollbar.config(command=targets.yview)
+        for path in found_safe:
+            targets.insert('end', path)
+
+        tk.Label(
+            review,
+            text="Nothing is deleted: targets move to a dated quarantine folder.",
+            font=("Consolas", 9), bg='#1a1a2e', fg='#00ffc8'
+        ).pack(pady=8)
+        buttons = tk.Frame(review, bg='#1a1a2e')
+        buttons.pack(pady=(0, 15))
+        tk.Button(
+            buttons, text="move to quarantine", font=("Consolas", 10, "bold"),
+            bg='#ffa502', fg='#1a1a2e', relief='flat', cursor='hand2',
+            command=lambda: (review.destroy(), self._do_purge(found_safe))
+        ).pack(side='left', padx=5)
+        tk.Button(
+            buttons, text="cancel", font=("Consolas", 10), bg='#16213e',
+            fg='#ffffff', relief='flat', cursor='hand2', command=review.destroy
+        ).pack(side='left', padx=5)
 
     def _do_purge(self, locations):
-        deleted = 0
+        moved = 0
         failed = 0
+        quarantine = QUARANTINE_DIR / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        quarantine.mkdir(parents=True, exist_ok=False)
+        manifest = []
 
-        for loc in locations:
+        for index, loc in enumerate(locations, start=1):
             try:
-                # Go up to find the ffmpeg folder root
-                # (might be in a 'bin' subfolder)
-                target = loc
-                parent = os.path.dirname(loc)
-                parent_name = os.path.basename(parent).lower()
-
-                if 'ffmpeg' in parent_name:
-                    target = parent
-
-                shutil.rmtree(target)
-                deleted += 1
-            except Exception:
+                target = Path(loc)
+                if not target.exists():
+                    raise FileNotFoundError(target)
+                destination = quarantine / f"{index:02d}-{target.name}"
+                shutil.move(str(target), destination)
+                manifest.append({"original": str(target), "quarantined": str(destination)})
+                moved += 1
+            except Exception as error:
+                manifest.append({"original": str(loc), "error": str(error)})
                 failed += 1
+
+        (quarantine / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
 
         if failed:
             self.status.config(
-                text=f"obliterated {deleted}, {failed} survived",
+                text=f"quarantined {moved}, {failed} failed",
                 fg='#ffa502'
             )
         else:
             self.status.config(
-                text=f"obliterated {deleted} copies. cleansed.",
+                text=f"quarantined {moved} copies safely",
                 fg='#00ffc8'
             )
 
-        # Show the "fix your apps" dialog
-        if deleted > 0:
-            self._show_recovery_info()
+        if moved > 0:
+            self._show_recovery_info(quarantine)
 
-    def _show_recovery_info(self):
+    def _show_recovery_info(self, quarantine=None):
         """Show copyable code snippets for pointing apps to the new ffmpeg"""
         win = tk.Toplevel(self.root)
         win.title("ffmpeg-sitter // recovery")
         win.configure(bg='#1a1a2e')
-        win.geometry("550x420")
+        win.geometry("550x460")
         win.resizable(False, False)
 
         tk.Label(
@@ -581,10 +722,10 @@ import os
 os.environ["PATH"] = r"{BIN_DIR}" + os.pathsep + os.environ["PATH"]
 
 # Node.js
-process.env.PATH = "{bin_dir_unix}:" + process.env.PATH;
+process.env.PATH = "{bin_dir_unix}" + require("path").delimiter + process.env.PATH;
 
 # Ruby
-ENV["PATH"] = "{bin_dir_unix}" + ":" + ENV["PATH"]
+ENV["PATH"] = "{bin_dir_unix}" + File::PATH_SEPARATOR + ENV["PATH"]
 
 # Rust (std::process::Command)
 {rust_line}
@@ -605,6 +746,13 @@ $env:PATH = "{BIN_DIR};" + $env:PATH'''
             bg='#1a1a2e',
             fg='#666'
         ).pack(pady=10)
+
+        if quarantine:
+            tk.Label(
+                win,
+                text=f"quarantine manifest: {quarantine / 'manifest.json'}",
+                font=("Consolas", 8), bg='#1a1a2e', fg='#888', wraplength=510
+            ).pack(pady=(0, 8))
 
 
 if __name__ == '__main__':
